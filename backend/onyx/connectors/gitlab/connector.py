@@ -1,3 +1,4 @@
+import codecs
 import fnmatch
 import itertools
 from collections import deque
@@ -211,22 +212,50 @@ def _convert_issue_to_document(issue: Any) -> Document:
 def _looks_like_binary(data: bytes, sample_size: int = 8192) -> bool:
     """Heuristic to detect binary content that shouldn't be indexed as text.
 
-    Checks a leading sample for:
-      - A NUL byte (definitive signal of binary content in text formats).
-      - A high proportion (>30%) of bytes outside the printable ASCII / common
-        whitespace range, which reliably flags encoded images, fonts, archives
-        etc. even when they lack NUL bytes.
+    Decides on a leading sample, in four steps:
+      1. A NUL byte means binary. Text encodings this connector handles never
+         produce one.
+      2. A sample dense in ASCII control characters is binary. This has to be
+         judged before the decode below, because control bytes are themselves
+         valid UTF-8 and would otherwise be waved through as text.
+      3. Content that decodes as UTF-8 is text, in any language. Decoding runs
+         incrementally so a multi-byte sequence split by the sample boundary is
+         not mistaken for corruption.
+      4. Otherwise the bytes are either legacy single-byte text or binary.
+         Binary is dense in bytes outside printable ASCII, so flag a sample
+         where they exceed 30%.
 
-    UTF-8 encoded text of any language passes because valid multi-byte
-    sequences are still counted as "text-like" per byte on average.
+    Step 4 counts high-bit bytes; step 2 cannot. Counting only the sub-0x80
+    control range caps the achievable ratio at ~11% for uniformly distributed
+    data, well under any useful threshold, which would leave the NUL check as
+    the only real guard and let small binaries through.
+
+    The tradeoff is legacy encodings dense in high-bit bytes — Shift-JIS or GBK
+    source, or heavily accented Latin-1 — which read as binary and are skipped.
+    Decoding those as Latin-1 only ever produced mojibake, so skipping them
+    costs no real retrieval quality.
     """
     if not data:
         return False
+
     sample = data[:sample_size]
     if b"\x00" in sample:
         return True
+
     text_bytes = set(range(0x20, 0x7F)) | {0x09, 0x0A, 0x0D, 0x0C}
-    non_text = sum(1 for b in sample if b not in text_bytes and b < 0x80)
+
+    control = sum(1 for b in sample if b < 0x80 and b not in text_bytes)
+    if (control / len(sample)) > 0.30:
+        return True
+
+    try:
+        # final=False so a trailing partial character is buffered, not an error.
+        codecs.getincrementaldecoder("utf-8")().decode(sample, final=False)
+        return False
+    except UnicodeDecodeError:
+        pass
+
+    non_text = sum(1 for b in sample if b not in text_bytes)
     return (non_text / len(sample)) > 0.30
 
 

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import random
+import zlib
+
 import pytest
 
 from onyx.connectors.gitlab.connector import (
@@ -135,3 +138,39 @@ class TestLooksLikeBinary:
         # No NUL, but mostly control bytes -> should still be flagged.
         payload = bytes(b for b in range(1, 32) if b not in (9, 10, 12, 13)) * 100
         assert _looks_like_binary(payload)
+
+    def test_high_bit_bytes_without_nul_are_binary(self) -> None:
+        """Regression: high-bit bytes must count toward the non-text ratio.
+
+        Counting only sub-0x80 control bytes caps the ratio at ~11% for
+        uniformly distributed data, so nothing could ever cross the 30%
+        threshold and the NUL check silently became the only guard.
+        """
+        payload = bytes(range(0x80, 0x100)) * 8
+        assert _looks_like_binary(payload)
+
+    def test_small_binary_without_nul_is_binary(self) -> None:
+        """A short blob can miss the NUL check by chance; the ratio must catch it."""
+        random.seed(11)
+        payload = bytes(random.randrange(1, 256) for _ in range(120))
+        assert b"\x00" not in payload
+        assert _looks_like_binary(payload)
+
+    def test_compressed_payload_without_nul_is_binary(self) -> None:
+        payload = zlib.compress(b"A" * 5000 + bytes(range(256)) * 8).replace(
+            b"\x00", b"\xfe"
+        )
+        assert b"\x00" not in payload
+        assert _looks_like_binary(payload)
+
+    def test_latin1_text_is_not_binary(self) -> None:
+        """Legacy single-byte text is sparse in high-bit bytes and must survive."""
+        payload = ("Cafe naive resume\n".encode("latin-1") + b"\xe9\xe8\xfc") * 60
+        assert not _looks_like_binary(payload)
+
+    def test_utf8_split_across_the_sample_boundary_is_not_binary(self) -> None:
+        """A multi-byte character straddling the sample edge is not corruption."""
+        payload = ("\u3042" * 5000).encode("utf-8")
+        assert len(payload) > 8192
+        assert payload[8191] & 0xC0 == 0x80  # boundary lands mid-character
+        assert not _looks_like_binary(payload)
